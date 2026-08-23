@@ -1,138 +1,92 @@
-import csv
-import json
 import os
 import re
 import time
-from urllib.parse import urljoin, urlparse
+import random
 import pandas as pd
-from openai import OpenAI
+from urllib.parse import urlparse, urljoin, unquote
 from playwright.sync_api import sync_playwright
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+print("\n=============================================")
+print("   OFFLINE-READY ZERO-BLEED LEAD ENGINE      ")
+print("=============================================\n")
 
-# Gemini API Client using free OpenAI-compatible endpoint
-client = (
-    OpenAI(
-        api_key=GEMINI_API_KEY,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    )
-    if GEMINI_API_KEY
-    else None
-)
+# Configuration
+INPUT_FILE = "leads_input.csv"
+OUTPUT_FILE = "leads_output.xlsx"
+OUTPUT_CSV_FILE = "leads_output.csv"
 
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-PHONE_RE = re.compile(
-    r"(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}"
+# Set HEADLESS=False in environment variables for local GUI debugging
+HEADLESS_MODE = os.environ.get("HEADLESS", "true").lower() == "true"
+
+# Blacklist filters for false-positive emails
+EMAIL_BLACKLIST_EXTENSIONS = (
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.css', '.js', '.woff', '.ttf'
 )
-EMAIL_JUNK = (
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".svg",
-    ".webp",
-    "@sentry",
-    "example.com",
-    "@wixpress",
-)
-CONTACT_HINTS = ("contact", "about", "kontakt", "reach", "touch", "impressum")
-SEARCH_BLOCKLIST = (
-    "duckduckgo.com",
-    "google.com",
-    "youtube.com",
-    "facebook.com",
-    "instagram.com",
-    "yelp.com",
-    "linkedin.com",
-    "twitter.com",
-    "x.com",
-    "yellowpages.com",
-    "wikipedia.org",
+EMAIL_BLACKLIST_DOMAINS = (
+    'sentry.io', 'wixpress.com', 'domain.com', 'example.com', 'schema.org', 'gravatar.com'
 )
 
 
-def html_to_text(html: str) -> str:
-    """Strips HTML noise to minimize token size for AI analysis."""
-    text = re.sub(
-        r"<(script|style|svg|noscript)[^>]*>.*?</\1>",
-        " ",
-        html,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    text = re.sub(r"<[^>]+>", " ", text)
-    return re.sub(r"\s+", " ", text).strip()[:12000]
-
-
-def gemini_extract_contacts(text: str) -> dict:
-    """Fallback AI extraction via Gemini if regex fails."""
-    if not client or not text:
-        return {"email": "N/A", "phone": "N/A", "socials": []}
-
-    prompt = (
-        "Extract official business contact details from the following website text. "
-        "Return strictly a JSON object with keys: 'email' (string or 'N/A'), "
-        "'phone' (string or 'N/A'), and 'socials' (list of social media URL strings).\n\n"
-        f"TEXT:\n{text}"
-    )
-
+def get_clean_domain(url):
+    """Extracts base domain from a given URL."""
     try:
-        response = client.chat.completions.create(
-            model="gemini-2.5-flash",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a contact extraction assistant. Output strictly valid JSON.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.1,
-        )
-        data = json.loads(response.choices[0].message.content or "{}")
-        return {
-            "email": data.get("email", "N/A"),
-            "phone": data.get("phone", "N/A"),
-            "socials": data.get("socials", []),
-        }
-    except Exception as e:
-        print(f"    [!] Gemini AI Extraction Error: {e}")
-        return {"email": "N/A", "phone": "N/A", "socials": []}
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain
+    except Exception:
+        return None
 
 
-def search_fallback_website(page, company_name: str, city: str) -> str:
-    """If no website on Google Maps, search Google/DuckDuckGo to find company website."""
-    query = f"{company_name} {city}"
-    print(f"    [*] No website on Maps. Searching web for: '{query}'...")
+def duckduckgo_search_fallback(page, company_name, city):
+    """
+    CAPTCHA-FREE FALLBACK: Uses DuckDuckGo Lite to find the business website
+    if missing on Google Maps.
+    """
     try:
-        page.goto(
-            f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}",
-            timeout=15000,
-            wait_until="domcontentloaded",
-        )
-        page.wait_for_timeout(1000)
+        search_query = f"{company_name} {city} website"
+        page.goto("https://lite.duckduckgo.com/lite/", timeout=15000, wait_until="domcontentloaded")
+        
+        page.fill('input[name="q"]', search_query)
+        page.click('input[type="submit"]')
+        page.wait_for_timeout(1500)
+        
+        links = page.locator('a[href]').all()
+        for link in links:
+            href = link.get_attribute("href") or ""
+            
+            if "uddg=" in href:
+                match = re.search(r'uddg=([^&]+)', href)
+                if match:
+                    href = unquote(match.group(1))
 
-        for link in page.locator("a.result__url").all()[:10]:
-            href = (link.get_attribute("href") or "").strip()
-            if href.startswith("//"):
-                href = "https:" + href
-            if href.startswith("http") and not any(
-                b in href.lower() for b in SEARCH_BLOCKLIST
-            ):
-                print(f"    [✓] Discovered Website via Web Search: {href}")
+            href_lower = href.lower()
+            if href.startswith("http") and not any(k in href_lower for k in [
+                "duckduckgo.com", "google.com", "youtube.com", "facebook.com", "instagram.com", 
+                "yelp.com", "linkedin.com", "twitter.com", "x.com", "tripadvisor.com", "foursquare.com", 
+                "mapquest.com", "yellowpages.com", "groupon.com"
+            ]):
                 return href
     except Exception as e:
-        print(f"    [!] Search fallback error: {e}")
+        print(f"      [!] DDG Search Fallback warning: {e}")
     return "N/A"
 
 
-def deep_crawl_website(context, website_url: str, initial_phone: str) -> dict:
-    """Navigates website, discovers contact subpages, and extracts contact info."""
+def deep_crawl_website(context, website_url, existing_phone):
+    """
+    DEEP CRAWLER ENGINE: Scrapes target website homepage + contact pages
+    for emails (mailto/regex), phone numbers, and social media channels.
+    """
     data = {
-        "Email": "N/A",
-        "Phone": initial_phone or "N/A",
-        "Socials": [],
-        "Website": website_url,
+        "Email": "N/A", 
+        "Phone": existing_phone if existing_phone else "N/A", 
+        "Facebook": "N/A", 
+        "Instagram": "N/A", 
+        "LinkedIn": "N/A", 
+        "Twitter": "N/A"
     }
+
     if not website_url or website_url == "N/A" or "google.com" in website_url:
         return data
 
@@ -142,272 +96,330 @@ def deep_crawl_website(context, website_url: str, initial_phone: str) -> dict:
     page = None
     try:
         page = context.new_page()
-        page.goto(website_url, timeout=20000, wait_until="domcontentloaded")
-        page.wait_for_timeout(1000)
+        page.set_extra_http_headers({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        })
 
-        # Discover Contact/About subpages
-        subpage_urls = [website_url]
         try:
-            for a in page.locator("a[href]").all()[:150]:
-                href = (a.get_attribute("href") or "").strip()
-                if any(h in href.lower() for h in CONTACT_HINTS):
-                    full_url = urljoin(website_url, href).split("#")[0]
-                    if full_url not in subpage_urls and len(subpage_urls) < 3:
-                        subpage_urls.append(full_url)
+            page.goto(website_url, timeout=12000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1000)
+        except Exception:
+            return data
+
+        domain = get_clean_domain(website_url)
+        pages_to_visit = [website_url]
+
+        # Find key contact/about subpages
+        try:
+            anchors = page.locator("a[href]").all()
+            subpage_urls = set()
+            for a in anchors:
+                href = a.get_attribute("href") or ""
+                href_lower = href.lower()
+                if any(term in href_lower for term in ["contact", "about", "info", "reach", "location", "team"]):
+                    full_sub_url = urljoin(website_url, href)
+                    if domain and domain in get_clean_domain(full_sub_url) or "":
+                        subpage_urls.add(full_sub_url)
+            pages_to_visit.extend(list(subpage_urls)[:2])
         except Exception:
             pass
 
-        collected_emails = set()
-        collected_phones = set()
-        homepage_text = ""
-
-        # Crawl homepage and discovered contact pages
-        for idx, url in enumerate(subpage_urls):
-            try:
-                if idx > 0:
-                    page.goto(
-                        url, timeout=15000, wait_until="domcontentloaded"
-                    )
+        for target_url in pages_to_visit:
+            if target_url != website_url:
+                try:
+                    page.goto(target_url, timeout=8000, wait_until="domcontentloaded")
                     page.wait_for_timeout(1000)
+                except Exception:
+                    continue
 
-                html = page.content()
-                if idx == 0:
-                    homepage_text = html_to_text(html)
+            # 1. PRIORITY EMAIL EXTRACTION: mailto: links
+            if data["Email"] == "N/A":
+                try:
+                    mailto_links = page.locator('a[href^="mailto:"]').all()
+                    for mailto in mailto_links:
+                        raw_href = mailto.get_attribute("href") or ""
+                        clean_email = raw_href.replace("mailto:", "").split("?")[0].strip()
+                        if clean_email and "@" in clean_email:
+                            data["Email"] = clean_email
+                            break
+                except Exception:
+                    pass
 
-                # Extract emails
-                for e in EMAIL_RE.findall(html):
-                    if not any(j in e.lower() for j in EMAIL_JUNK):
-                        collected_emails.add(e.lower())
+            # 2. FALLBACK EMAIL EXTRACTION: Regex scan on raw HTML
+            if data["Email"] == "N/A":
+                raw_html = page.content()
+                scraped_emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', raw_html)
+                for email in scraped_emails:
+                    email_lower = email.lower()
+                    if any(email_lower.endswith(ext) for ext in EMAIL_BLACKLIST_EXTENSIONS):
+                        continue
+                    if any(b_domain in email_lower for b_domain in EMAIL_BLACKLIST_DOMAINS):
+                        continue
+                    data["Email"] = email
+                    break
 
-                # Extract phones from tel: links
-                for tel_el in page.locator('a[href^="tel:"]').all():
-                    href = tel_el.get_attribute("href") or ""
-                    clean_p = re.sub(r"[^\d+()\-.\s]", "", href.replace("tel:", "")).strip()
-                    if len(clean_p) >= 7:
-                        collected_phones.add(clean_p)
+            # 3. PHONE EXTRACTION FALLBACK
+            if data["Phone"] in ["N/A", ""]:
+                # Check tel: links first
+                try:
+                    tel_links = page.locator('a[href^="tel:"]').all()
+                    if tel_links:
+                        tel_href = tel_links[0].get_attribute("href") or ""
+                        data["Phone"] = tel_href.replace("tel:", "").strip()
+                except Exception:
+                    pass
 
+                # Fallback to Regex on page inner text
+                if data["Phone"] in ["N/A", ""]:
+                    body_text = page.locator("body").inner_text() or ""
+                    phone_match = re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', body_text)
+                    if phone_match:
+                        data["Phone"] = phone_match.group(0)
+
+            # 4. SOCIAL MEDIA LINK EXTRACTION
+            try:
+                links = page.locator("a[href]").all()
+                for link in links:
+                    href = link.get_attribute("href") or ""
+                    href_lower = href.lower()
+                    if "facebook.com" in href_lower and data["Facebook"] == "N/A":
+                        data["Facebook"] = href
+                    elif "instagram.com" in href_lower and data["Instagram"] == "N/A":
+                        data["Instagram"] = href
+                    elif "linkedin.com" in href_lower and data["LinkedIn"] == "N/A":
+                        data["LinkedIn"] = href
+                    elif any(t in href_lower for t in ["twitter.com", "x.com"]) and data["Twitter"] == "N/A":
+                        data["Twitter"] = href
             except Exception:
-                continue
-
-        # Set best found values
-        if collected_emails:
-            data["Email"] = sorted(collected_emails)[0]
-
-        if data["Phone"] == "N/A" and collected_phones:
-            data["Phone"] = sorted(collected_phones)[0]
-
-        # Trigger Gemini AI if Email or Phone is still missing
-        if (
-            (data["Email"] == "N/A" or data["Phone"] == "N/A")
-            and client
-            and homepage_text
-        ):
-            print("    [*] Calling Gemini AI to extract missing contacts...")
-            ai_res = gemini_extract_contacts(homepage_text)
-            if data["Email"] == "N/A" and ai_res.get("email") != "N/A":
-                data["Email"] = ai_res["email"]
-            if data["Phone"] == "N/A" and ai_res.get("phone") != "N/A":
-                data["Phone"] = ai_res["phone"]
-            if ai_res.get("socials"):
-                data["Socials"] = ai_res["socials"]
+                pass
 
     except Exception as e:
-        print(f"    [!] Website Crawl Error ({website_url}): {e}")
+        print(f"      [!] Error crawling website {website_url}: {e}")
     finally:
         if page:
-            page.close()
+            try:
+                page.close()
+            except Exception:
+                pass
 
     return data
 
 
-def append_lead(lead: dict, filepath: str = "leads_output.csv"):
-    """Appends scraped data directly to leads_output.csv."""
-    file_exists = os.path.isfile(filepath)
-    fieldnames = [
-        "Company Name",
-        "Category",
-        "City",
-        "Phone Number",
-        "Website",
-        "Email/Gmail",
-        "Social Links",
+def is_missing_website(url):
+    """Checks if a URL string is invalid or missing."""
+    if url is None:
+        return True
+    cleaned = str(url).strip()
+    if not cleaned:
+        return True
+    return cleaned.lower() in {"n/a", "none"}
+
+
+def run_pipeline():
+    # Ensure input queue file exists
+    if not os.path.exists(INPUT_FILE):
+        template_df = pd.DataFrame({"Specialty": ["Clinic"], "City": ["Abbeville"]})
+        template_df.to_csv(INPUT_FILE, index=False)
+        print(f"[+++] Created template queue spreadsheet: '{INPUT_FILE}'")
+        return
+
+    df_tasks = pd.read_csv(INPUT_FILE)
+    df_tasks.columns = [str(c).strip().capitalize() for c in df_tasks.columns]
+    specialty_col = 'Speciality' if 'Speciality' in df_tasks.columns else 'Specialty'
+
+    if specialty_col not in df_tasks.columns or 'City' not in df_tasks.columns:
+        print("[-] Data Header Error: CSV columns must be distinctly labeled 'Specialty' and 'City'.")
+        return
+
+    seen_names = set()
+    total_tasks = len(df_tasks)
+    print(f"[+] Initializing Scraper Engine across {total_tasks} target tasks...")
+    print(f"[+] Running Mode: {'Headless (Offline/CI/CD)' if HEADLESS_MODE else 'Headed (GUI)'}\n")
+
+    all_output_rows = []
+    missing_website_rows = []
+    output_columns = [
+        "Searched Specialty", "Searched City", "Company Name", "Phone Number",
+        "Website", "Email/Gmail", "Facebook", "Instagram", "LinkedIn", "Twitter/X"
     ]
-    with open(filepath, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(lead)
 
-
-def mark_done(index: int, filepath: str = "leads_input.csv"):
-    """Updates row status in input queue file."""
-    df = pd.read_csv(filepath)
-    df.at[index, "Status"] = "done"
-    df.to_csv(filepath, index=False)
-
-
-def run_agent():
-    input_file = "leads_input.csv"
-    if not os.path.exists(input_file):
-        print(f"[!] Input queue file '{input_file}' not found.")
-        return
-
-    df = pd.read_csv(input_file)
-    pending = df[df["Status"].str.lower() == "pending"]
-
-    if pending.empty:
-        print("[*] No pending tasks found in queue.")
-        return
-
-    print(f"[*] Processing {len(pending)} search tasks...")
-
+    # Initialize Playwright Engine ONCE globally
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=HEADLESS_MODE,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu"
+            ]
+        )
 
-        for idx, row in pending.iterrows():
-            specialty = row["Specialty"]
-            city = row["City"]
-            query = f"{specialty} in {city}"
-            print(f"\n==========================================")
-            print(f"[+] Task {idx + 1}: Searching '{query}'")
-            print(f"==========================================")
+        for task_idx, row in df_tasks.iterrows():
+            target_specialty = str(row[specialty_col]).strip()
+            target_city = str(row['City']).strip()
 
+            if pd.isna(target_specialty) or pd.isna(target_city) or not target_specialty or not target_city:
+                continue
+
+            search_query = f"{target_specialty} in {target_city}"
+            print(f"=========================================================================")
+            print(f"[*] TASK [{task_idx + 1}/{total_tasks}]: {search_query.upper()}")
+            print(f"=========================================================================")
+
+            # Create an isolated browser context per task
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                locale="en-US",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
             )
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
             maps_page = context.new_page()
             search_page = context.new_page()
 
+            clean_url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
+
             try:
-                maps_page.goto(
-                    f"https://www.google.com/maps/search/{query.replace(' ', '+')}",
-                    timeout=60000,
-                )
+                maps_page.goto(clean_url, wait_until="domcontentloaded", timeout=30000)
                 maps_page.wait_for_timeout(3000)
+            except Exception as e:
+                print(f"    [!] Initial map load adjustment: {e}")
 
-                # Consent Dismissal
-                if "consent.google" in maps_page.url:
-                    for btn_txt in ["Reject all", "Accept all", "I agree"]:
-                        if (
-                            maps_page.locator(
-                                f'button:has-text("{btn_txt}")'
-                            ).count()
-                            > 0
-                        ):
-                            maps_page.locator(
-                                f'button:has-text("{btn_txt}")'
-                            ).first.click()
-                            maps_page.wait_for_timeout(2000)
-                            break
+            # Locate feed container
+            listings_feed = maps_page.locator('div[role="feed"]')
+            if listings_feed.count() == 0:
+                listings_feed = maps_page.locator('div[aria-label*="Results for"]')
 
-                feed = maps_page.locator('div[role="feed"]')
-                if feed.count() == 0:
-                    feed = maps_page.locator('div[aria-label*="Results for"]')
+            # Scroll and load result cards
+            last_count = 0
+            strikes = 0
+            while True:
+                try:
+                    listings_feed.evaluate("el => el.scrollTo(0, el.scrollHeight)")
+                except Exception:
+                    maps_page.keyboard.press("PageDown")
 
-                if feed.count() == 0:
-                    print("  [-] No search results panel detected on Maps.")
-                    mark_done(idx, input_file)
-                    context.close()
-                    continue
+                maps_page.wait_for_timeout(1200)
 
-                # Scroll results list
-                for _ in range(4):
-                    feed.evaluate("el => el.scrollBy(0, 1000)")
-                    maps_page.wait_for_timeout(1500)
+                current_count = maps_page.locator('a[href*="/maps/place/"]').count()
+                if current_count == last_count:
+                    strikes += 1
+                    if strikes >= 3:
+                        break
+                else:
+                    strikes = 0
 
-                listing_cards = maps_page.locator('a[href*="/maps/place/"]')
-                total = min(listing_cards.count(), 10)
-                print(f"  [*] Found {total} listings on Google Maps.")
+                if current_count >= 30:  # Extraction cap per keyword batch
+                    break
+                last_count = current_count
 
-                for i in range(total):
-                    try:
-                        # Re-query elements dynamically to avoid stale elements
-                        card = maps_page.locator('a[href*="/maps/place/"]').nth(
-                            i
-                        )
-                        card.click(timeout=8000)
-                        maps_page.wait_for_timeout(2000)
+            cards = maps_page.locator('a[href*="/maps/place/"]').all()
+            total_cards = len(cards)
+            print(f"    [+] Found {total_cards} properties matching query.")
 
-                        # Extract Name
-                        name = (
-                            card.get_attribute("aria-label")
-                            or maps_page.locator("h1").first.inner_text()
-                            or "N/A"
-                        ).strip()
+            current_city_leads = []
 
-                        # Extract Phone from Maps side panel
-                        phone = "N/A"
-                        phone_el = maps_page.locator(
-                            'button[data-item-id^="phone:tel:"]'
-                        )
-                        if phone_el.count() > 0:
-                            phone = (
-                                phone_el.first.get_attribute("data-item-id")
-                                or ""
-                            ).replace("phone:tel:", "").strip() or "N/A"
-
-                        if phone == "N/A":
-                            phone_alt = maps_page.locator(
-                                'button[aria-label^="Phone:"]'
-                            )
-                            if phone_alt.count() > 0:
-                                phone = (
-                                    phone_alt.first.get_attribute("aria-label")
-                                    or ""
-                                ).replace("Phone:", "").strip() or "N/A"
-
-                        # Extract Website from Maps side panel
-                        website = "N/A"
-                        web_el = maps_page.locator(
-                            'a[data-item-id="authority"]'
-                        )
-                        if web_el.count() > 0:
-                            website = (
-                                web_el.first.get_attribute("href") or "N/A"
-                            )
-
-                        # IF NO WEBSITE ON MAPS: Search Google / DuckDuckGo
-                        if website == "N/A":
-                            website = search_fallback_website(
-                                search_page, name, city
-                            )
-
-                        # Deep Crawl Website + Contact Pages
-                        crawl = deep_crawl_website(context, website, phone)
-
-                        lead_record = {
-                            "Company Name": name,
-                            "Category": specialty,
-                            "City": city,
-                            "Phone Number": crawl["Phone"],
-                            "Website": website,
-                            "Email/Gmail": crawl["Email"],
-                            "Social Links": (
-                                ", ".join(crawl["Socials"])
-                                if crawl["Socials"]
-                                else "N/A"
-                            ),
-                        }
-
-                        append_lead(lead_record)
-                        print(
-                            f"  [✓] Lead Saved: {name} | Phone: {crawl['Phone']} | Email: {crawl['Email']}"
-                        )
-
-                    except Exception as listing_err:
-                        print(f"  [!] Listing Error ({i+1}): {listing_err}")
+            for card in cards:
+                try:
+                    raw_name = card.get_attribute("aria-label") or "Unknown Business"
+                    name = raw_name.strip()
+                    if name in seen_names or name == "Unknown Business":
                         continue
 
-                mark_done(idx, input_file)
+                    card.click()
+                    maps_page.wait_for_timeout(1500)
 
-            except Exception as task_err:
-                print(f"  [!] Task Failed ({query}): {task_err}")
-            finally:
-                context.close()
+                    phone = "N/A"
+                    website = "N/A"
+
+                    # Website Extraction
+                    web_el = maps_page.locator('a[data-item-id="authority"]')
+                    if web_el.count() > 0:
+                        website = web_el.get_attribute("href") or "N/A"
+                    else:
+                        all_panel_links = maps_page.locator('div[role="main"] a[href]').all()
+                        for link in all_panel_links:
+                            href = link.get_attribute("href") or ""
+                            if "google.com" not in href and href.startswith("http"):
+                                website = href
+                                break
+
+                    # Phone Extraction
+                    phone_el = maps_page.locator('button[data-item-id^="phone:tel:"]')
+                    if phone_el.count() > 0:
+                        phone = phone_el.get_attribute("data-item-id").replace("phone:tel:", "").strip()
+                    else:
+                        panel_main = maps_page.locator('div[role="main"]').first
+                        if panel_main.count() > 0:
+                            panel_text = panel_main.inner_text() or ""
+                            phone_match = re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', panel_text)
+                            if phone_match:
+                                phone = phone_match.group(0)
+
+                    current_city_leads.append({
+                        "Target Specialty": target_specialty,
+                        "Target City": target_city,
+                        "Company Name": name,
+                        "Phone Number": phone,
+                        "Website": website
+                    })
+                    seen_names.add(name)
+
+                except Exception as e:
+                    print(f"      [!] Card processing error: {e}")
+                    continue
+
+            # Fallback search for missing websites
+            if current_city_leads:
+                print("    [*] Discovering missing websites via DuckDuckGo...")
+                for lead in current_city_leads:
+                    if is_missing_website(lead["Website"]):
+                        discovered_url = duckduckgo_search_fallback(search_page, lead["Company Name"], lead["Target City"])
+                        lead["Website"] = discovered_url
+
+                # Deep Crawling for Emails and Social Media Links
+                print("    [*] Deep crawling target domains for emails and social handles...")
+                for idx, base_lead in enumerate(current_city_leads):
+                    print(f"      [{idx + 1}/{len(current_city_leads)}] Domain Audit: {base_lead['Company Name']}")
+                    crawl_data = deep_crawl_website(context, base_lead["Website"], base_lead["Phone Number"])
+
+                    row_data = {
+                        "Searched Specialty": base_lead["Target Specialty"],
+                        "Searched City": base_lead["Target City"],
+                        "Company Name": base_lead["Company Name"],
+                        "Phone Number": crawl_data["Phone"],
+                        "Website": base_lead["Website"],
+                        "Email/Gmail": crawl_data["Email"],
+                        "Facebook": crawl_data["Facebook"],
+                        "Instagram": crawl_data["Instagram"],
+                        "LinkedIn": crawl_data["LinkedIn"],
+                        "Twitter/X": crawl_data["Twitter"]
+                    }
+
+                    all_output_rows.append(row_data)
+                    if is_missing_website(base_lead["Website"]):
+                        missing_website_rows.append(row_data)
+
+            # Close context per task to release memory resources
+            context.close()
+
+            # INCREMENTAL SAVE: Save state after each keyword finishes
+            if all_output_rows:
+                all_df = pd.DataFrame(all_output_rows, columns=output_columns)
+                missing_df = pd.DataFrame(missing_website_rows, columns=output_columns)
+
+                with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+                    all_df.to_excel(writer, sheet_name="All Data", index=False)
+                    missing_df.to_excel(writer, sheet_name="No Website", index=False)
+
+                all_df.to_csv(OUTPUT_CSV_FILE, index=False)
+                print(f"[+++] Progress saved cleanly for task {task_idx + 1}/{total_tasks}.\n")
 
         browser.close()
 
+    print(f"\n[+++] RUN COMPLETE! Data compiled into '{OUTPUT_FILE}' and '{OUTPUT_CSV_FILE}'")
+
 
 if __name__ == "__main__":
-    run_agent()
+    run_pipeline()
