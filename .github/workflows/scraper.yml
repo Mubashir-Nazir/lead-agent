@@ -1,9 +1,13 @@
 name: Offline Lead Scraper
 
 on:
-  workflow_dispatch: # Manual trigger button in GitHub Actions tab
+  workflow_dispatch: # Manual trigger button
   schedule:
-    - cron: '0 0 * * *' # Automated daily execution at midnight UTC
+    - cron: '0 0 * * *' # Runs daily at midnight UTC
+
+# CRITICAL FIX: Grants write permissions to commit scraped CSV/Excel outputs
+permissions:
+  contents: write
 
 jobs:
   run-scraper:
@@ -24,6 +28,13 @@ jobs:
           playwright install chromium
           sudo playwright install-deps chromium
 
+      - name: Ensure Input File Exists
+        run: |
+          if [ ! -f leads_input.csv ]; then
+            echo "Specialty,City" > leads_input.csv
+            echo "Clinic,Abbeville" >> leads_input.csv
+          fi
+
       - name: Run Lead Scraper Engine
         env:
           HEADLESS: "true"
@@ -31,8 +42,8 @@ jobs:
 
       - name: Commit Scraped Lead Files
         run: |
-          git config --global user.name "GitHub Actions Bot"
-          git config --global user.email "bot@github.com"
-          git add -A
-          git commit -m "Auto-update scraped leads [skip ci]" || exit 0
-          git push
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add leads_output.csv leads_output.xlsx leads_input.csv || true
+          git commit -m "Auto-update scraped leads [skip ci]" || echo "No changes to commit"
+          git push origin HEAD:${{ github.ref_name }} || echo "Nothing to push"
