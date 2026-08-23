@@ -20,39 +20,40 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies
+      - name: Install Python & Playwright Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas openpyxl playwright
           playwright install chromium
           sudo playwright install-deps chromium
 
-      - name: Verify Input File Exists
+      - name: Ensure Input CSV Exists
         run: |
           if [ ! -f leads_input.csv ]; then
             echo "Specialty,City" > leads_input.csv
             echo "Clinic,Abbeville" >> leads_input.csv
+            echo "[+] Created default leads_input.csv"
           fi
 
       - name: Run Lead Scraper Engine
         env:
           HEADLESS: "true"
-        run: python agent.py
+        run: python -u agent.py
 
-      - name: Upload Scraped Files to GitHub Actions (Downloadable ZIP)
+      - name: Upload Output Artifacts (ZIP Download)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scraped-leads-data
+          name: scraped-leads-files
           path: |
             leads_output.csv
             leads_output.xlsx
 
-      - name: Commit Output Back To Repository
+      - name: Commit Scraped Files
         if: success()
         run: |
           git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add leads_output.csv leads_output.xlsx leads_input.csv || true
-          git commit -m "Auto-update scraped leads [skip ci]" || echo "No changes"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Auto-update scraped leads [skip ci]" || echo "No changes to commit"
           git push origin HEAD:${{ github.ref_name }} || echo "Push skipped"
