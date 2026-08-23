@@ -1,40 +1,38 @@
-name: Run Scraper Agent Offline (Free Gemini API)
+name: Offline Lead Scraper
 
 on:
+  workflow_dispatch: # Manual trigger
   schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    - cron: '0 0 * * *' # Daily automatic run
 
 jobs:
-  scrape:
+  run-scraper:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repo code
-        uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          pip install pandas openai python-dotenv playwright
-          playwright install-deps
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl playwright
           playwright install chromium
+          playwright install-deps
 
-      - name: Run Scraper Agent
+      - name: Run Lead Scraper Engine
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python agent.py
+          HEADLESS: "true"
+        run: python your_script_name.py
 
-      - name: Save scraped leads back to repository
+      - name: Commit Scraped Lead Files
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add leads_output.csv leads_input.csv
-          git commit -m "Auto-update scraped leads" || exit 0
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "bot@github.com"
+          git add leads_output.xlsx leads_output.csv
+          git commit -m "Auto-update scraped leads [skip ci]" || exit 0
           git push
