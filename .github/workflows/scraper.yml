@@ -3,10 +3,11 @@ name: Offline Lead Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *' # Auto-runs every 4 hours to clear queue cleanly
+    - cron: '0 */6 * * *'
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   run-scraper:
@@ -29,7 +30,6 @@ jobs:
       - name: Run Lead Scraper Engine
         env:
           HEADLESS: "true"
-          MAX_TASKS: "20"
         run: python -u agent.py
 
       - name: Upload Output Artifacts (ZIP Download)
@@ -41,11 +41,31 @@ jobs:
             leads_output.csv
             leads_output.xlsx
 
-      - name: Commit Scraped Files
+      - name: Commit Scraped Files Back to Repo
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add leads_output.csv leads_output.xlsx || true
-          git commit -m "Auto-update scraped leads batch [skip ci]" || echo "No changes to commit"
+          git commit -m "Auto-update continuous lead batch [skip ci]" || echo "No changes to commit"
           git push origin HEAD:${{ github.ref_name }} || echo "Push skipped"
+
+      - name: Auto-Trigger Next Run If Unscraped Cities Remain
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -c "
+          import os, pandas as pd
+          if os.path.exists('leads_input.xlsx'):
+              inp = pd.read_excel('leads_input.xlsx')
+              spec_col = 'Speciality' if 'Speciality' in inp.columns else 'Specialty'
+              out_tasks = set()
+              if os.path.exists('leads_output.xlsx'):
+                  out = pd.read_excel('leads_output.xlsx')
+                  for _, r in out.iterrows():
+                      out_tasks.add(f\"{str(r.get('Searched Specialty','')).strip().lower()}|{str(r.get('Searched City','')).strip().lower()}\")
+              pending = [r for _, r in inp.iterrows() if f\"{str(r.get(spec_col,'')).strip().lower()}|{str(r.get('City','')).strip().lower()}\" not in out_tasks]
+              if len(pending) > 0:
+                  print('PENDING_TASKS_EXIST')
+          " | grep -q "PENDING_TASKS_EXIST" && gh workflow run scraper.yml || echo "All cities completed!"
