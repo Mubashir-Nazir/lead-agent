@@ -26,13 +26,6 @@ jobs:
           pip install pandas openpyxl playwright
           python -m playwright install --with-deps chromium
 
-      - name: Ensure Input CSV Exists
-        run: |
-          if [ ! -f leads_input.csv ]; then
-            echo "Specialty,City" > leads_input.csv
-            echo "Clinic,Abbeville" >> leads_input.csv
-          fi
-
       - name: Run Lead Scraper Engine
         env:
           HEADLESS: "true"
