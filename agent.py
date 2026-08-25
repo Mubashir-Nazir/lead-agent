@@ -15,8 +15,8 @@ INPUT_FILE_CSV = "leads_input.csv"
 OUTPUT_FILE = "leads_output.xlsx"
 OUTPUT_CSV_FILE = "leads_output.csv"
 
-# Batch control to prevent 6-hour timeouts
-MAX_TASKS_PER_RUN = int(os.environ.get("MAX_TASKS", "20"))
+BATCH_SIZE = 20
+MAX_RUN_SECONDS = 16200  # 4.5 Hours safety limit per GitHub job
 HEADLESS_MODE = os.environ.get("HEADLESS", "true").lower() == "true"
 
 EMAIL_BLACKLIST_EXTENSIONS = (
@@ -184,13 +184,20 @@ def deep_crawl_website(context, website_url, existing_phone):
     return data
 
 
+def save_leads_to_disk(all_output_rows, output_columns):
+    all_df = pd.DataFrame(all_output_rows, columns=output_columns)
+    all_df.to_csv(OUTPUT_CSV_FILE, index=False)
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+        all_df.to_excel(writer, sheet_name="All Data", index=False)
+
+
 def run_pipeline():
+    start_time = time.time()
     output_columns = [
         "Searched Specialty", "Searched City", "Company Name", "Phone Number",
         "Website", "Email/Gmail", "Facebook", "Instagram", "LinkedIn", "Twitter/X"
     ]
 
-    # Load Existing Leads (Resume Support)
     all_output_rows = []
     completed_tasks = set()
 
@@ -203,11 +210,10 @@ def run_pipeline():
                 city = str(r.get("Searched City", "")).strip().lower()
                 if spec and city:
                     completed_tasks.add(f"{spec}|{city}")
-            print(f"[+] Loaded {len(all_output_rows)} existing leads. Completed tasks: {len(completed_tasks)}", flush=True)
+            print(f"[+] Loaded {len(all_output_rows)} existing leads across {len(completed_tasks)} finished cities.", flush=True)
         except Exception as e:
-            print(f"[!] Warning loading output file: {e}", flush=True)
+            print(f"[!] Warning loading existing output: {e}", flush=True)
 
-    # Load Tasks Queue
     if os.path.exists(INPUT_FILE_XLSX):
         df_tasks = pd.read_excel(INPUT_FILE_XLSX)
     elif os.path.exists(INPUT_FILE_CSV):
@@ -221,7 +227,7 @@ def run_pipeline():
     specialty_col = 'Speciality' if 'Speciality' in df_tasks.columns else 'Specialty'
 
     if specialty_col not in df_tasks.columns or 'City' not in df_tasks.columns:
-        print("[-] Data Header Error: File must have 'Specialty' and 'City' headers.", flush=True)
+        print("[-] Data Header Error: Input file must have 'Specialty' and 'City' headers.", flush=True)
         sys.exit(1)
 
     seen_names = {str(r.get("Company Name", "")).strip() for r in all_output_rows if r.get("Company Name")}
@@ -238,12 +244,12 @@ def run_pipeline():
 
     total_pending = len(tasks_to_run)
     if total_pending == 0:
-        print("[+++] All tasks in queue have already been scraped! Exiting cleanly.", flush=True)
+        print("[+++] All tasks in queue have already been scraped! Exiting.", flush=True)
         return
 
-    print(f"[+] Total Pending Tasks: {total_pending}. Running batch cap: {MAX_TASKS_PER_RUN}\n", flush=True)
-    batch_tasks = tasks_to_run[:MAX_TASKS_PER_RUN]
+    print(f"[+] Total Remaining Cities: {total_pending}.", flush=True)
 
+    batch_number = 1
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS_MODE,
@@ -256,129 +262,135 @@ def run_pipeline():
             ]
         )
 
-        for task_idx, (target_specialty, target_city) in enumerate(batch_tasks):
-            search_query = f"{target_specialty} in {target_city}"
-            print(f"=========================================================================", flush=True)
-            print(f"[*] BATCH TASK [{task_idx + 1}/{len(batch_tasks)}]: {search_query.upper()}", flush=True)
-            print(f"=========================================================================", flush=True)
+        while tasks_to_run:
+            elapsed_time = time.time() - start_time
+            if elapsed_time > MAX_RUN_SECONDS:
+                print(f"[!] Reached safety time limit (4.5h). Pausing for next auto-trigger run.", flush=True)
+                break
 
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
-            )
-            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            current_batch = tasks_to_run[:BATCH_SIZE]
+            tasks_to_run = tasks_to_run[BATCH_SIZE:]
 
-            maps_page = context.new_page()
-            search_page = context.new_page()
+            print(f"\n=========================================================================", flush=True)
+            print(f"[*] STARTING BATCH #{batch_number} ({len(current_batch)} CITIES)", flush=True)
+            print(f"=========================================================================\n", flush=True)
 
-            clean_url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
+            for task_idx, (target_specialty, target_city) in enumerate(current_batch):
+                search_query = f"{target_specialty} in {target_city}"
+                print(f"[*] CITY [{task_idx + 1}/{len(current_batch)} in Batch #{batch_number}]: {search_query.upper()}", flush=True)
 
-            try:
-                maps_page.goto(clean_url, wait_until="domcontentloaded", timeout=30000)
-                handle_google_consent(maps_page)
-            except Exception as e:
-                print(f"    [!] Map load notice: {e}", flush=True)
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 800}
+                )
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-            listings_feed = maps_page.locator('div[role="feed"]')
-            if listings_feed.count() == 0:
-                listings_feed = maps_page.locator('div[aria-label*="Results for"]')
+                maps_page = context.new_page()
+                search_page = context.new_page()
 
-            last_count = 0
-            strikes = 0
-            while True:
+                clean_url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
+
                 try:
-                    listings_feed.evaluate("el => el.scrollTo(0, el.scrollHeight)")
-                except Exception:
-                    maps_page.keyboard.press("PageDown")
+                    maps_page.goto(clean_url, wait_until="domcontentloaded", timeout=30000)
+                    handle_google_consent(maps_page)
+                except Exception as e:
+                    print(f"    [!] Map load notice: {e}", flush=True)
 
-                maps_page.wait_for_timeout(1200)
+                listings_feed = maps_page.locator('div[role="feed"]')
+                if listings_feed.count() == 0:
+                    listings_feed = maps_page.locator('div[aria-label*="Results for"]')
 
-                current_count = maps_page.locator('a[href*="/maps/place/"]').count()
-                if current_count == last_count:
-                    strikes += 1
-                    if strikes >= 3:
+                last_count = 0
+                strikes = 0
+                while True:
+                    try:
+                        listings_feed.evaluate("el => el.scrollTo(0, el.scrollHeight)")
+                    except Exception:
+                        maps_page.keyboard.press("PageDown")
+
+                    maps_page.wait_for_timeout(1200)
+
+                    current_count = maps_page.locator('a[href*="/maps/place/"]').count()
+                    if current_count == last_count:
+                        strikes += 1
+                        if strikes >= 3:
+                            break
+                    else:
+                        strikes = 0
+
+                    if current_count >= 20:
                         break
-                else:
-                    strikes = 0
+                    last_count = current_count
 
-                if current_count >= 20:
-                    break
-                last_count = current_count
+                cards = maps_page.locator('a[href*="/maps/place/"]').all()
+                print(f"    [+] Found {len(cards)} listings.", flush=True)
 
-            cards = maps_page.locator('a[href*="/maps/place/"]').all()
-            print(f"    [+] Found {len(cards)} listings for task.", flush=True)
+                current_city_leads = []
 
-            current_city_leads = []
+                for card in cards:
+                    try:
+                        raw_name = card.get_attribute("aria-label") or "Unknown Business"
+                        name = raw_name.strip()
+                        if name in seen_names or name == "Unknown Business":
+                            continue
 
-            for card in cards:
-                try:
-                    raw_name = card.get_attribute("aria-label") or "Unknown Business"
-                    name = raw_name.strip()
-                    if name in seen_names or name == "Unknown Business":
+                        card.click()
+                        maps_page.wait_for_timeout(1500)
+
+                        phone = "N/A"
+                        website = "N/A"
+
+                        web_el = maps_page.locator('a[data-item-id="authority"]')
+                        if web_el.count() > 0:
+                            website = web_el.get_attribute("href") or "N/A"
+
+                        phone_el = maps_page.locator('button[data-item-id^="phone:tel:"]')
+                        if phone_el.count() > 0:
+                            phone = phone_el.get_attribute("data-item-id").replace("phone:tel:", "").strip()
+
+                        current_city_leads.append({
+                            "Target Specialty": target_specialty,
+                            "Target City": target_city,
+                            "Company Name": name,
+                            "Phone Number": phone,
+                            "Website": website
+                        })
+                        seen_names.add(name)
+
+                    except Exception:
                         continue
 
-                    card.click()
-                    maps_page.wait_for_timeout(1500)
+                if current_city_leads:
+                    for base_lead in current_city_leads:
+                        if base_lead["Website"] in ["N/A", ""]:
+                            base_lead["Website"] = duckduckgo_search_fallback(search_page, base_lead["Company Name"], base_lead["Target City"])
 
-                    phone = "N/A"
-                    website = "N/A"
+                        crawl_data = deep_crawl_website(context, base_lead["Website"], base_lead["Phone Number"])
 
-                    web_el = maps_page.locator('a[data-item-id="authority"]')
-                    if web_el.count() > 0:
-                        website = web_el.get_attribute("href") or "N/A"
+                        row_data = {
+                            "Searched Specialty": base_lead["Target Specialty"],
+                            "Searched City": base_lead["Target City"],
+                            "Company Name": base_lead["Company Name"],
+                            "Phone Number": crawl_data["Phone"],
+                            "Website": base_lead["Website"],
+                            "Email/Gmail": crawl_data["Email"],
+                            "Facebook": crawl_data["Facebook"],
+                            "Instagram": crawl_data["Instagram"],
+                            "LinkedIn": crawl_data["LinkedIn"],
+                            "Twitter/X": crawl_data["Twitter"]
+                        }
 
-                    phone_el = maps_page.locator('button[data-item-id^="phone:tel:"]')
-                    if phone_el.count() > 0:
-                        phone = phone_el.get_attribute("data-item-id").replace("phone:tel:", "").strip()
+                        all_output_rows.append(row_data)
 
-                    current_city_leads.append({
-                        "Target Specialty": target_specialty,
-                        "Target City": target_city,
-                        "Company Name": name,
-                        "Phone Number": phone,
-                        "Website": website
-                    })
-                    seen_names.add(name)
+                context.close()
+                save_leads_to_disk(all_output_rows, output_columns)
 
-                except Exception:
-                    continue
-
-            if current_city_leads:
-                for idx, base_lead in enumerate(current_city_leads):
-                    if base_lead["Website"] in ["N/A", ""]:
-                        base_lead["Website"] = duckduckgo_search_fallback(search_page, base_lead["Company Name"], base_lead["Target City"])
-
-                    crawl_data = deep_crawl_website(context, base_lead["Website"], base_lead["Phone Number"])
-
-                    row_data = {
-                        "Searched Specialty": base_lead["Target Specialty"],
-                        "Searched City": base_lead["Target City"],
-                        "Company Name": base_lead["Company Name"],
-                        "Phone Number": crawl_data["Phone"],
-                        "Website": base_lead["Website"],
-                        "Email/Gmail": crawl_data["Email"],
-                        "Facebook": crawl_data["Facebook"],
-                        "Instagram": crawl_data["Instagram"],
-                        "LinkedIn": crawl_data["LinkedIn"],
-                        "Twitter/X": crawl_data["Twitter"]
-                    }
-
-                    all_output_rows.append(row_data)
-
-            context.close()
-
-            # Incremental save state
-            all_df = pd.DataFrame(all_output_rows, columns=output_columns)
-            all_df.to_csv(OUTPUT_CSV_FILE, index=False)
-            with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-                all_df.to_excel(writer, sheet_name="All Data", index=False)
-
-            print(f"[+++] Progress saved for task {task_idx + 1}/{len(batch_tasks)}.\n", flush=True)
+            print(f"[+++] BATCH #{batch_number} FINISHED & SAVED! Total rows in sheet: {len(all_output_rows)}", flush=True)
+            batch_number += 1
 
         browser.close()
 
-    remaining_after_batch = total_pending - len(batch_tasks)
-    print(f"\n[+++] BATCH COMPLETE! Scraped {len(batch_tasks)} tasks. Remaining in queue: {remaining_after_batch}", flush=True)
+    print(f"\n[+++] RUN COMPLETE! Data saved sequentially in '{OUTPUT_FILE}'", flush=True)
 
 
 if __name__ == "__main__":
