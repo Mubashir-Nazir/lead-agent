@@ -3,7 +3,7 @@ name: Offline Lead Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 */4 * * *' # Auto-runs every 4 hours to clear queue cleanly
 
 permissions:
   contents: write
@@ -29,6 +29,7 @@ jobs:
       - name: Run Lead Scraper Engine
         env:
           HEADLESS: "true"
+          MAX_TASKS: "20"
         run: python -u agent.py
 
       - name: Upload Output Artifacts (ZIP Download)
@@ -41,10 +42,10 @@ jobs:
             leads_output.xlsx
 
       - name: Commit Scraped Files
-        if: success()
+        if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Auto-update scraped leads [skip ci]" || echo "No changes to commit"
+          git add leads_output.csv leads_output.xlsx || true
+          git commit -m "Auto-update scraped leads batch [skip ci]" || echo "No changes to commit"
           git push origin HEAD:${{ github.ref_name }} || echo "Push skipped"
