@@ -15,6 +15,8 @@ INPUT_FILE_CSV = "leads_input.csv"
 OUTPUT_FILE = "leads_output.xlsx"
 OUTPUT_CSV_FILE = "leads_output.csv"
 
+# Batch control to prevent 6-hour timeouts
+MAX_TASKS_PER_RUN = int(os.environ.get("MAX_TASKS", "20"))
 HEADLESS_MODE = os.environ.get("HEADLESS", "true").lower() == "true"
 
 EMAIL_BLACKLIST_EXTENSIONS = (
@@ -183,35 +185,64 @@ def deep_crawl_website(context, website_url, existing_phone):
 
 
 def run_pipeline():
-    # Load Excel input first, fallback to CSV
+    output_columns = [
+        "Searched Specialty", "Searched City", "Company Name", "Phone Number",
+        "Website", "Email/Gmail", "Facebook", "Instagram", "LinkedIn", "Twitter/X"
+    ]
+
+    # Load Existing Leads (Resume Support)
+    all_output_rows = []
+    completed_tasks = set()
+
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            existing_df = pd.read_excel(OUTPUT_FILE)
+            all_output_rows = existing_df.to_dict("records")
+            for r in all_output_rows:
+                spec = str(r.get("Searched Specialty", "")).strip().lower()
+                city = str(r.get("Searched City", "")).strip().lower()
+                if spec and city:
+                    completed_tasks.add(f"{spec}|{city}")
+            print(f"[+] Loaded {len(all_output_rows)} existing leads. Completed tasks: {len(completed_tasks)}", flush=True)
+        except Exception as e:
+            print(f"[!] Warning loading output file: {e}", flush=True)
+
+    # Load Tasks Queue
     if os.path.exists(INPUT_FILE_XLSX):
         df_tasks = pd.read_excel(INPUT_FILE_XLSX)
-        print(f"[+] Loaded task queue from '{INPUT_FILE_XLSX}'", flush=True)
     elif os.path.exists(INPUT_FILE_CSV):
         df_tasks = pd.read_csv(INPUT_FILE_CSV)
-        print(f"[+] Loaded task queue from '{INPUT_FILE_CSV}'", flush=True)
     else:
         template_df = pd.DataFrame({"Specialty": ["Clinic"], "City": ["Abbeville"]})
         template_df.to_excel(INPUT_FILE_XLSX, index=False)
         df_tasks = template_df
-        print(f"[+++] Created default Excel input template: '{INPUT_FILE_XLSX}'", flush=True)
 
     df_tasks.columns = [str(c).strip().capitalize() for c in df_tasks.columns]
     specialty_col = 'Speciality' if 'Speciality' in df_tasks.columns else 'Specialty'
 
     if specialty_col not in df_tasks.columns or 'City' not in df_tasks.columns:
-        print("[-] Data Header Error: Excel file must have 'Specialty' and 'City' column headers.", flush=True)
+        print("[-] Data Header Error: File must have 'Specialty' and 'City' headers.", flush=True)
         sys.exit(1)
 
-    seen_names = set()
-    total_tasks = len(df_tasks)
-    print(f"[+] Starting Scraper across {total_tasks} tasks (Headless: {HEADLESS_MODE})...\n", flush=True)
+    seen_names = {str(r.get("Company Name", "")).strip() for r in all_output_rows if r.get("Company Name")}
 
-    all_output_rows = []
-    output_columns = [
-        "Searched Specialty", "Searched City", "Company Name", "Phone Number",
-        "Website", "Email/Gmail", "Facebook", "Instagram", "LinkedIn", "Twitter/X"
-    ]
+    tasks_to_run = []
+    for idx, row in df_tasks.iterrows():
+        spec = str(row[specialty_col]).strip()
+        city = str(row['City']).strip()
+        if not spec or not city or pd.isna(spec) or pd.isna(city):
+            continue
+        task_key = f"{spec.lower()}|{city.lower()}"
+        if task_key not in completed_tasks:
+            tasks_to_run.append((spec, city))
+
+    total_pending = len(tasks_to_run)
+    if total_pending == 0:
+        print("[+++] All tasks in queue have already been scraped! Exiting cleanly.", flush=True)
+        return
+
+    print(f"[+] Total Pending Tasks: {total_pending}. Running batch cap: {MAX_TASKS_PER_RUN}\n", flush=True)
+    batch_tasks = tasks_to_run[:MAX_TASKS_PER_RUN]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -225,16 +256,10 @@ def run_pipeline():
             ]
         )
 
-        for task_idx, row in df_tasks.iterrows():
-            target_specialty = str(row[specialty_col]).strip()
-            target_city = str(row['City']).strip()
-
-            if pd.isna(target_specialty) or pd.isna(target_city) or not target_specialty or not target_city:
-                continue
-
+        for task_idx, (target_specialty, target_city) in enumerate(batch_tasks):
             search_query = f"{target_specialty} in {target_city}"
             print(f"=========================================================================", flush=True)
-            print(f"[*] TASK [{task_idx + 1}/{total_tasks}]: {search_query.upper()}", flush=True)
+            print(f"[*] BATCH TASK [{task_idx + 1}/{len(batch_tasks)}]: {search_query.upper()}", flush=True)
             print(f"=========================================================================", flush=True)
 
             context = browser.new_context(
@@ -342,16 +367,18 @@ def run_pipeline():
 
             context.close()
 
+            # Incremental save state
             all_df = pd.DataFrame(all_output_rows, columns=output_columns)
             all_df.to_csv(OUTPUT_CSV_FILE, index=False)
             with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
                 all_df.to_excel(writer, sheet_name="All Data", index=False)
 
-            print(f"[+++] Progress saved for task {task_idx + 1}/{total_tasks}.\n", flush=True)
+            print(f"[+++] Progress saved for task {task_idx + 1}/{len(batch_tasks)}.\n", flush=True)
 
         browser.close()
 
-    print(f"\n[+++] RUN COMPLETE! Data saved to '{OUTPUT_FILE}' and '{OUTPUT_CSV_FILE}'", flush=True)
+    remaining_after_batch = total_pending - len(batch_tasks)
+    print(f"\n[+++] BATCH COMPLETE! Scraped {len(batch_tasks)} tasks. Remaining in queue: {remaining_after_batch}", flush=True)
 
 
 if __name__ == "__main__":
