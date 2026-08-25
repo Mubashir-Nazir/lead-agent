@@ -1,24 +1,22 @@
 import os
 import re
+import sys
 import time
-import random
 import pandas as pd
 from urllib.parse import urlparse, urljoin, unquote
 from playwright.sync_api import sync_playwright
 
-print("\n=============================================")
-print("   OFFLINE-READY ZERO-BLEED LEAD ENGINE      ")
-print("=============================================\n")
+print("\n=============================================", flush=True)
+print("   OFFLINE-READY ZERO-BLEED LEAD ENGINE      ", flush=True)
+print("=============================================\n", flush=True)
 
-# Configuration
-INPUT_FILE = "leads_input.csv"
+INPUT_FILE_XLSX = "leads_input.xlsx"
+INPUT_FILE_CSV = "leads_input.csv"
 OUTPUT_FILE = "leads_output.xlsx"
 OUTPUT_CSV_FILE = "leads_output.csv"
 
-# Set HEADLESS=False in environment variables for local GUI debugging
 HEADLESS_MODE = os.environ.get("HEADLESS", "true").lower() == "true"
 
-# Blacklist filters for false-positive emails
 EMAIL_BLACKLIST_EXTENSIONS = (
     '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.css', '.js', '.woff', '.ttf'
 )
@@ -28,7 +26,6 @@ EMAIL_BLACKLIST_DOMAINS = (
 
 
 def get_clean_domain(url):
-    """Extracts base domain from a given URL."""
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.lower()
@@ -39,11 +36,19 @@ def get_clean_domain(url):
         return None
 
 
+def handle_google_consent(page):
+    try:
+        page.wait_for_timeout(2000)
+        consent_buttons = page.locator('button:has-text("Accept all"), button:has-text("I agree"), form[action*="consent"] button')
+        if consent_buttons.count() > 0:
+            print("    [*] Bypassing Google Cookie Consent popup...", flush=True)
+            consent_buttons.first.click(timeout=5000)
+            page.wait_for_timeout(2000)
+    except Exception:
+        pass
+
+
 def duckduckgo_search_fallback(page, company_name, city):
-    """
-    CAPTCHA-FREE FALLBACK: Uses DuckDuckGo Lite to find the business website
-    if missing on Google Maps.
-    """
     try:
         search_query = f"{company_name} {city} website"
         page.goto("https://lite.duckduckgo.com/lite/", timeout=15000, wait_until="domcontentloaded")
@@ -55,7 +60,6 @@ def duckduckgo_search_fallback(page, company_name, city):
         links = page.locator('a[href]').all()
         for link in links:
             href = link.get_attribute("href") or ""
-            
             if "uddg=" in href:
                 match = re.search(r'uddg=([^&]+)', href)
                 if match:
@@ -64,20 +68,15 @@ def duckduckgo_search_fallback(page, company_name, city):
             href_lower = href.lower()
             if href.startswith("http") and not any(k in href_lower for k in [
                 "duckduckgo.com", "google.com", "youtube.com", "facebook.com", "instagram.com", 
-                "yelp.com", "linkedin.com", "twitter.com", "x.com", "tripadvisor.com", "foursquare.com", 
-                "mapquest.com", "yellowpages.com", "groupon.com"
+                "yelp.com", "linkedin.com", "twitter.com", "x.com", "tripadvisor.com"
             ]):
                 return href
     except Exception as e:
-        print(f"      [!] DDG Search Fallback warning: {e}")
+        print(f"      [!] DDG Search Fallback warning: {e}", flush=True)
     return "N/A"
 
 
 def deep_crawl_website(context, website_url, existing_phone):
-    """
-    DEEP CRAWLER ENGINE: Scrapes target website homepage + contact pages
-    for emails (mailto/regex), phone numbers, and social media channels.
-    """
     data = {
         "Email": "N/A", 
         "Phone": existing_phone if existing_phone else "N/A", 
@@ -109,7 +108,6 @@ def deep_crawl_website(context, website_url, existing_phone):
         domain = get_clean_domain(website_url)
         pages_to_visit = [website_url]
 
-        # Find key contact/about subpages
         try:
             anchors = page.locator("a[href]").all()
             subpage_urls = set()
@@ -118,7 +116,7 @@ def deep_crawl_website(context, website_url, existing_phone):
                 href_lower = href.lower()
                 if any(term in href_lower for term in ["contact", "about", "info", "reach", "location", "team"]):
                     full_sub_url = urljoin(website_url, href)
-                    if domain and domain in get_clean_domain(full_sub_url) or "":
+                    if domain and domain in (get_clean_domain(full_sub_url) or ""):
                         subpage_urls.add(full_sub_url)
             pages_to_visit.extend(list(subpage_urls)[:2])
         except Exception:
@@ -132,7 +130,6 @@ def deep_crawl_website(context, website_url, existing_phone):
                 except Exception:
                     continue
 
-            # 1. PRIORITY EMAIL EXTRACTION: mailto: links
             if data["Email"] == "N/A":
                 try:
                     mailto_links = page.locator('a[href^="mailto:"]').all()
@@ -145,7 +142,6 @@ def deep_crawl_website(context, website_url, existing_phone):
                 except Exception:
                     pass
 
-            # 2. FALLBACK EMAIL EXTRACTION: Regex scan on raw HTML
             if data["Email"] == "N/A":
                 raw_html = page.content()
                 scraped_emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', raw_html)
@@ -158,25 +154,6 @@ def deep_crawl_website(context, website_url, existing_phone):
                     data["Email"] = email
                     break
 
-            # 3. PHONE EXTRACTION FALLBACK
-            if data["Phone"] in ["N/A", ""]:
-                # Check tel: links first
-                try:
-                    tel_links = page.locator('a[href^="tel:"]').all()
-                    if tel_links:
-                        tel_href = tel_links[0].get_attribute("href") or ""
-                        data["Phone"] = tel_href.replace("tel:", "").strip()
-                except Exception:
-                    pass
-
-                # Fallback to Regex on page inner text
-                if data["Phone"] in ["N/A", ""]:
-                    body_text = page.locator("body").inner_text() or ""
-                    phone_match = re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', body_text)
-                    if phone_match:
-                        data["Phone"] = phone_match.group(0)
-
-            # 4. SOCIAL MEDIA LINK EXTRACTION
             try:
                 links = page.locator("a[href]").all()
                 for link in links:
@@ -194,7 +171,7 @@ def deep_crawl_website(context, website_url, existing_phone):
                 pass
 
     except Exception as e:
-        print(f"      [!] Error crawling website {website_url}: {e}")
+        print(f"      [!] Error crawling {website_url}: {e}", flush=True)
     finally:
         if page:
             try:
@@ -205,45 +182,37 @@ def deep_crawl_website(context, website_url, existing_phone):
     return data
 
 
-def is_missing_website(url):
-    """Checks if a URL string is invalid or missing."""
-    if url is None:
-        return True
-    cleaned = str(url).strip()
-    if not cleaned:
-        return True
-    return cleaned.lower() in {"n/a", "none"}
-
-
 def run_pipeline():
-    # Ensure input queue file exists
-    if not os.path.exists(INPUT_FILE):
+    # Load Excel input first, fallback to CSV
+    if os.path.exists(INPUT_FILE_XLSX):
+        df_tasks = pd.read_excel(INPUT_FILE_XLSX)
+        print(f"[+] Loaded task queue from '{INPUT_FILE_XLSX}'", flush=True)
+    elif os.path.exists(INPUT_FILE_CSV):
+        df_tasks = pd.read_csv(INPUT_FILE_CSV)
+        print(f"[+] Loaded task queue from '{INPUT_FILE_CSV}'", flush=True)
+    else:
         template_df = pd.DataFrame({"Specialty": ["Clinic"], "City": ["Abbeville"]})
-        template_df.to_csv(INPUT_FILE, index=False)
-        print(f"[+++] Created template queue spreadsheet: '{INPUT_FILE}'")
-        return
+        template_df.to_excel(INPUT_FILE_XLSX, index=False)
+        df_tasks = template_df
+        print(f"[+++] Created default Excel input template: '{INPUT_FILE_XLSX}'", flush=True)
 
-    df_tasks = pd.read_csv(INPUT_FILE)
     df_tasks.columns = [str(c).strip().capitalize() for c in df_tasks.columns]
     specialty_col = 'Speciality' if 'Speciality' in df_tasks.columns else 'Specialty'
 
     if specialty_col not in df_tasks.columns or 'City' not in df_tasks.columns:
-        print("[-] Data Header Error: CSV columns must be distinctly labeled 'Specialty' and 'City'.")
-        return
+        print("[-] Data Header Error: Excel file must have 'Specialty' and 'City' column headers.", flush=True)
+        sys.exit(1)
 
     seen_names = set()
     total_tasks = len(df_tasks)
-    print(f"[+] Initializing Scraper Engine across {total_tasks} target tasks...")
-    print(f"[+] Running Mode: {'Headless (Offline/CI/CD)' if HEADLESS_MODE else 'Headed (GUI)'}\n")
+    print(f"[+] Starting Scraper across {total_tasks} tasks (Headless: {HEADLESS_MODE})...\n", flush=True)
 
     all_output_rows = []
-    missing_website_rows = []
     output_columns = [
         "Searched Specialty", "Searched City", "Company Name", "Phone Number",
         "Website", "Email/Gmail", "Facebook", "Instagram", "LinkedIn", "Twitter/X"
     ]
 
-    # Initialize Playwright Engine ONCE globally
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS_MODE,
@@ -264,11 +233,10 @@ def run_pipeline():
                 continue
 
             search_query = f"{target_specialty} in {target_city}"
-            print(f"=========================================================================")
-            print(f"[*] TASK [{task_idx + 1}/{total_tasks}]: {search_query.upper()}")
-            print(f"=========================================================================")
+            print(f"=========================================================================", flush=True)
+            print(f"[*] TASK [{task_idx + 1}/{total_tasks}]: {search_query.upper()}", flush=True)
+            print(f"=========================================================================", flush=True)
 
-            # Create an isolated browser context per task
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 800}
@@ -282,16 +250,14 @@ def run_pipeline():
 
             try:
                 maps_page.goto(clean_url, wait_until="domcontentloaded", timeout=30000)
-                maps_page.wait_for_timeout(3000)
+                handle_google_consent(maps_page)
             except Exception as e:
-                print(f"    [!] Initial map load adjustment: {e}")
+                print(f"    [!] Map load notice: {e}", flush=True)
 
-            # Locate feed container
             listings_feed = maps_page.locator('div[role="feed"]')
             if listings_feed.count() == 0:
                 listings_feed = maps_page.locator('div[aria-label*="Results for"]')
 
-            # Scroll and load result cards
             last_count = 0
             strikes = 0
             while True:
@@ -310,13 +276,12 @@ def run_pipeline():
                 else:
                     strikes = 0
 
-                if current_count >= 30:  # Extraction cap per keyword batch
+                if current_count >= 20:
                     break
                 last_count = current_count
 
             cards = maps_page.locator('a[href*="/maps/place/"]').all()
-            total_cards = len(cards)
-            print(f"    [+] Found {total_cards} properties matching query.")
+            print(f"    [+] Found {len(cards)} listings for task.", flush=True)
 
             current_city_leads = []
 
@@ -333,29 +298,13 @@ def run_pipeline():
                     phone = "N/A"
                     website = "N/A"
 
-                    # Website Extraction
                     web_el = maps_page.locator('a[data-item-id="authority"]')
                     if web_el.count() > 0:
                         website = web_el.get_attribute("href") or "N/A"
-                    else:
-                        all_panel_links = maps_page.locator('div[role="main"] a[href]').all()
-                        for link in all_panel_links:
-                            href = link.get_attribute("href") or ""
-                            if "google.com" not in href and href.startswith("http"):
-                                website = href
-                                break
 
-                    # Phone Extraction
                     phone_el = maps_page.locator('button[data-item-id^="phone:tel:"]')
                     if phone_el.count() > 0:
                         phone = phone_el.get_attribute("data-item-id").replace("phone:tel:", "").strip()
-                    else:
-                        panel_main = maps_page.locator('div[role="main"]').first
-                        if panel_main.count() > 0:
-                            panel_text = panel_main.inner_text() or ""
-                            phone_match = re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', panel_text)
-                            if phone_match:
-                                phone = phone_match.group(0)
 
                     current_city_leads.append({
                         "Target Specialty": target_specialty,
@@ -366,22 +315,14 @@ def run_pipeline():
                     })
                     seen_names.add(name)
 
-                except Exception as e:
-                    print(f"      [!] Card processing error: {e}")
+                except Exception:
                     continue
 
-            # Fallback search for missing websites
             if current_city_leads:
-                print("    [*] Discovering missing websites via DuckDuckGo...")
-                for lead in current_city_leads:
-                    if is_missing_website(lead["Website"]):
-                        discovered_url = duckduckgo_search_fallback(search_page, lead["Company Name"], lead["Target City"])
-                        lead["Website"] = discovered_url
-
-                # Deep Crawling for Emails and Social Media Links
-                print("    [*] Deep crawling target domains for emails and social handles...")
                 for idx, base_lead in enumerate(current_city_leads):
-                    print(f"      [{idx + 1}/{len(current_city_leads)}] Domain Audit: {base_lead['Company Name']}")
+                    if base_lead["Website"] in ["N/A", ""]:
+                        base_lead["Website"] = duckduckgo_search_fallback(search_page, base_lead["Company Name"], base_lead["Target City"])
+
                     crawl_data = deep_crawl_website(context, base_lead["Website"], base_lead["Phone Number"])
 
                     row_data = {
@@ -398,27 +339,19 @@ def run_pipeline():
                     }
 
                     all_output_rows.append(row_data)
-                    if is_missing_website(base_lead["Website"]):
-                        missing_website_rows.append(row_data)
 
-            # Close context per task to release memory resources
             context.close()
 
-            # INCREMENTAL SAVE: Save state after each keyword finishes
-            if all_output_rows:
-                all_df = pd.DataFrame(all_output_rows, columns=output_columns)
-                missing_df = pd.DataFrame(missing_website_rows, columns=output_columns)
+            all_df = pd.DataFrame(all_output_rows, columns=output_columns)
+            all_df.to_csv(OUTPUT_CSV_FILE, index=False)
+            with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+                all_df.to_excel(writer, sheet_name="All Data", index=False)
 
-                with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-                    all_df.to_excel(writer, sheet_name="All Data", index=False)
-                    missing_df.to_excel(writer, sheet_name="No Website", index=False)
-
-                all_df.to_csv(OUTPUT_CSV_FILE, index=False)
-                print(f"[+++] Progress saved cleanly for task {task_idx + 1}/{total_tasks}.\n")
+            print(f"[+++] Progress saved for task {task_idx + 1}/{total_tasks}.\n", flush=True)
 
         browser.close()
 
-    print(f"\n[+++] RUN COMPLETE! Data compiled into '{OUTPUT_FILE}' and '{OUTPUT_CSV_FILE}'")
+    print(f"\n[+++] RUN COMPLETE! Data saved to '{OUTPUT_FILE}' and '{OUTPUT_CSV_FILE}'", flush=True)
 
 
 if __name__ == "__main__":
