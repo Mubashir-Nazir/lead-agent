@@ -3,7 +3,7 @@ name: Offline Lead Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */1 * * *'
 
 permissions:
   contents: write
@@ -12,6 +12,8 @@ permissions:
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
+    timeout-minutes: 30 # HARD STOP: Kills job at 30 mins to prevent 6h error completely
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -21,7 +23,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Python & Playwright Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas openpyxl playwright
@@ -32,25 +34,16 @@ jobs:
           HEADLESS: "true"
         run: python -u agent.py
 
-      - name: Upload Output Artifacts (ZIP Download)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scraped-leads-files
-          path: |
-            leads_output.csv
-            leads_output.xlsx
-
-      - name: Commit Scraped Files Back to Repo
-        if: always()
+      - name: Save Scraped Progress to GitHub
+        if: always() # Runs even if Python stops early
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add leads_output.csv leads_output.xlsx || true
-          git commit -m "Auto-update continuous lead batch [skip ci]" || echo "No changes to commit"
+          git commit -m "Auto-save lead batch [skip ci]" || echo "No changes to commit"
           git push origin HEAD:${{ github.ref_name }} || echo "Push skipped"
 
-      - name: Auto-Trigger Next Run If Unscraped Cities Remain
+      - name: Auto-Trigger Next Batch (Relay Chain)
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -67,5 +60,5 @@ jobs:
                       out_tasks.add(f\"{str(r.get('Searched Specialty','')).strip().lower()}|{str(r.get('Searched City','')).strip().lower()}\")
               pending = [r for _, r in inp.iterrows() if f\"{str(r.get(spec_col,'')).strip().lower()}|{str(r.get('City','')).strip().lower()}\" not in out_tasks]
               if len(pending) > 0:
-                  print('PENDING_TASKS_EXIST')
-          " | grep -q "PENDING_TASKS_EXIST" && gh workflow run scraper.yml || echo "All cities completed!"
+                  print('HAS_MORE_CITIES')
+          " | grep -q "HAS_MORE_CITIES" && gh workflow run scraper.yml || echo "All cities in queue are completely scraped!"
