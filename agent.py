@@ -16,7 +16,7 @@ OUTPUT_FILE = "leads_output.xlsx"
 OUTPUT_CSV_FILE = "leads_output.csv"
 
 BATCH_SIZE = 15 
-MAX_RUN_SECONDS = 1500  # 25 minutes limit (safely under 30-min GitHub ceiling)
+MAX_RUN_SECONDS = 1500  # 25-minute limit (safely under 30-min GitHub ceiling)
 HEADLESS_MODE = os.environ.get("HEADLESS", "true").lower() == "true"
 
 EMAIL_BLACKLIST_EXTENSIONS = (
@@ -211,23 +211,48 @@ def run_pipeline():
         except Exception as e:
             print(f"[!] Notice: Creating fresh output file ({e})", flush=True)
 
+    # Safe Input File Loading
     if os.path.exists(INPUT_FILE_XLSX):
-        df_tasks = pd.read_excel(INPUT_FILE_XLSX)
+        try:
+            df_tasks = pd.read_excel(INPUT_FILE_XLSX)
+        except Exception as e:
+            print(f"[!] Error reading {INPUT_FILE_XLSX}: {e}", flush=True)
+            df_tasks = pd.DataFrame()
     elif os.path.exists(INPUT_FILE_CSV):
-        df_tasks = pd.read_csv(INPUT_FILE_CSV)
+        try:
+            df_tasks = pd.read_csv(INPUT_FILE_CSV)
+        except Exception as e:
+            print(f"[!] Error reading {INPUT_FILE_CSV}: {e}", flush=True)
+            df_tasks = pd.DataFrame()
     else:
-        print("[-] Input file not found!", flush=True)
-        sys.exit(1)
+        print(f"[!] Input file not found. Creating default template...", flush=True)
+        df_tasks = pd.DataFrame({"Specialty": ["Dental Clinic"], "City": ["Miami"]})
+        df_tasks.to_excel(INPUT_FILE_XLSX, index=False)
 
-    df_tasks.columns = [str(c).strip().capitalize() for c in df_tasks.columns]
-    specialty_col = 'Speciality' if 'Speciality' in df_tasks.columns else 'Specialty'
+    df_tasks.columns = [str(c).strip().title() for c in df_tasks.columns]
+    
+    specialty_col = None
+    for col in df_tasks.columns:
+        if col.lower() in ['specialty', 'speciality', 'category']:
+            specialty_col = col
+            break
+            
+    city_col = None
+    for col in df_tasks.columns:
+        if col.lower() in ['city', 'location']:
+            city_col = col
+            break
+
+    if not specialty_col or not city_col:
+        print(f"[-] Header Error: Columns found were {list(df_tasks.columns)}. Required: 'Specialty' and 'City'. Exiting cleanly.", flush=True)
+        return
 
     seen_names = {str(r.get("Company Name", "")).strip() for r in all_output_rows if r.get("Company Name")}
 
     tasks_to_run = []
     for idx, row in df_tasks.iterrows():
         spec = str(row[specialty_col]).strip()
-        city = str(row['City']).strip()
+        city = str(row[city_col]).strip()
         if not spec or not city or pd.isna(spec) or pd.isna(city):
             continue
         task_key = f"{spec.lower()}|{city.lower()}"
